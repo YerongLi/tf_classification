@@ -27,8 +27,10 @@ import os
 import numpy as np
 import tensorflow as tf
 import tensorflow.contrib.slim as slim
+from tensorflow.python.ops import control_flow_ops
 
 from config.parse_config import parse_config_file
+from deployment import model_deploy 
 from nets import nets_factory
 from preprocessing.inputs import input_nodes
 
@@ -190,27 +192,6 @@ def get_init_function(logdir, pretrained_model_path, checkpoint_exclude_scopes, 
     tf.logging.info('Restoring variables from %s' % checkpoint_path)
 
     if ema != None:
-        # # Restore each variable with its moving average value
-        # if restore_variables_with_moving_averages: 
-            
-        #     # Also restore the moving average variables
-        #     if restore_moving_averages:
-        #         variables_to_restore_with_ma = variables_to_restore + [ema.average(var) for var in variables_to_restore]
-        #         normal_saver = tf.train.Saver(variables_to_restore_with_ma, reshape=False)
-        #     else:
-        #         normal_saver = tf.train.Saver(variables_to_restore, reshape=False)
-        #     ema_saver = tf.train.Saver({
-        #         ema.average_name(var) : ema.average(var)
-        #         for var in variables_to_restore
-        #     }, reshape=False)
-            
-        #     def callback(session):
-        #         normal_saver.restore(session, checkpoint_path)
-        #         ema_saver.restore(session, checkpoint_path)
-        #     return callback
-        
-        # elif restore_moving_averages:
-        #     variables_to_restore += [ema.average(var) for var in variables_to_restore]
 
         # Load in the moving average value for a variable, rather than the variable itself
         if restore_variables_with_moving_averages:
@@ -248,7 +229,10 @@ def get_init_function(logdir, pretrained_model_path, checkpoint_exclude_scopes, 
         ignore_missing_vars=False)
 
 
-def train(tfrecords, logdir, cfg, pretrained_model_path=None, trainable_scopes=None, checkpoint_exclude_scopes=None, restore_variables_with_moving_averages=False, restore_moving_averages=False):
+def train(tfrecords, logdir, cfg, num_gpus=1, pretrained_model_path=None, 
+          trainable_scopes=None, checkpoint_exclude_scopes=None, 
+          restore_variables_with_moving_averages=False, 
+          restore_moving_averages=False):
     """
     Args:
         tfrecords (list)
@@ -264,10 +248,22 @@ def train(tfrecords, logdir, cfg, pretrained_model_path=None, trainable_scopes=N
     # Force all Variables to reside on the CPU.
     with graph.as_default():
 
-        # Create a variable to count the number of train() calls.
-        global_step = slim.get_or_create_global_step()
+        # deplyment configuration
+        deploy_config = model_deploy.DeploymentConfig(
+            num_clones=num_gpus,
+            clone_on_cpu=False,
+            replica_id=0,
+            num_replicas=1,
+            num_ps_tasks=0,
+            worker_job_name='worker',
+            ps_job_name='ps'
+        )
 
-        with tf.device('/cpu:0'):
+        # Create a variable to count the number of train() calls.
+        with tf.device(deploy_config.variables_device()):
+            global_step = slim.get_or_create_global_step()
+
+        with tf.device(deploy_config.inputs_device()):
             batch_dict = input_nodes(
                 tfrecords=tfrecords,
                 cfg=cfg.IMAGE_PROCESSING,
@@ -285,49 +281,46 @@ def train(tfrecords, logdir, cfg, pretrained_model_path=None, trainable_scopes=N
             batched_one_hot_labels = slim.one_hot_encoding(batch_dict['labels'],
                                                         num_classes=cfg.NUM_CLASSES)
         
-        # GVH: Doesn't seem to help to the poor queueing performance...
-        # batch_queue = slim.prefetch_queue.prefetch_queue(
-        #                   [batch_dict['inputs'], batched_one_hot_labels], capacity=2)
-        # inputs, labels = batch_queue.dequeue()
+            batch_queue = slim.prefetch_queue.prefetch_queue(
+                               [batch_dict['inputs'], batched_one_hot_labels], capacity=2 * deploy_config.num_clones)
 
-        arg_scope = nets_factory.arg_scopes_map[cfg.MODEL_NAME](
-            weight_decay=cfg.WEIGHT_DECAY,
-            batch_norm_decay=cfg.BATCHNORM_MOVING_AVERAGE_DECAY,
-            batch_norm_epsilon=cfg.BATCHNORM_EPSILON
-        )
-
-        with slim.arg_scope(arg_scope):
-            logits, end_points = nets_factory.networks_map[cfg.MODEL_NAME](
-                inputs=batch_dict['inputs'],
-                num_classes=cfg.NUM_CLASSES,
-                dropout_keep_prob=cfg.DROPOUT_KEEP_PROB,
-                is_training=True
-            )
+        network_fn = nets_factory.get_network_fn(
+            name=cfg.MODEL_NAME, 
+            num_classes=cfg.NUM_CLASSES, 
+            weight_decay=cfg.WEIGHT_DECAY, 
+            use_batch_norm=True,
+            batch_norm_decay=cfg.BATCHNORM_MOVING_AVERAGE_DECAY, 
+            batch_norm_epsilon=cfg.BATCHNORM_EPSILON, 
+            dropout_keep_prob=cfg.DROPOUT_KEEP_PROB, 
+            is_training=True)
+        
+        def clone_fn(batch_queue):
+            """Allows data parallelism by creating multiple clones of network_fn."""
+            images, labels = batch_queue.dequeue()
+            logits, end_points = network_fn(images)
 
             # Add the losses
             if 'AuxLogits' in end_points:
                 tf.losses.softmax_cross_entropy(
-                    logits=end_points['AuxLogits'], onehot_labels=batched_one_hot_labels,
+                    logits=end_points['AuxLogits'], onehot_labels=labels,
                     label_smoothing=0., weights=0.4, scope='aux_loss')
 
             tf.losses.softmax_cross_entropy(
-                logits=logits, onehot_labels=batched_one_hot_labels, label_smoothing=0., weights=1.0)
+                logits=logits, onehot_labels=labels, label_smoothing=0., weights=1.0)
 
-        
 
+        # Get the inital summaries
         summaries = set(tf.get_collection(tf.GraphKeys.SUMMARIES))
+
+        clones = model_deploy.create_clones(deploy_config, clone_fn, [batch_queue])
+        first_clone_scope = deploy_config.clone_scope(0)
+        # Gather update_ops from the first clone. These contain, for example,
+        # the updates for the batch_norm variables created by network_fn.
+        update_ops = tf.get_collection(tf.GraphKeys.UPDATE_OPS, first_clone_scope)
 
         # Summarize the losses
         for loss in tf.get_collection(tf.GraphKeys.LOSSES):
             summaries.add(tf.summary.scalar(name='losses/%s' % loss.op.name, tensor=loss))
-        
-        regularization_losses = tf.get_collection(tf.GraphKeys.REGULARIZATION_LOSSES)
-        if regularization_losses:
-            regularization_loss = tf.add_n(regularization_losses, name='regularization_loss')
-            summaries.add(tf.summary.scalar(name='losses/regularization_loss', tensor=regularization_loss))
-
-        total_loss = tf.losses.get_total_loss()
-        summaries.add(tf.summary.scalar(name='losses/total_loss', tensor=total_loss))
 
         ema = None
         if 'MOVING_AVERAGE_DECAY' in cfg and cfg.MOVING_AVERAGE_DECAY > 0: 
@@ -340,27 +333,39 @@ def train(tfrecords, logdir, cfg, pretrained_model_path=None, trainable_scopes=N
             moving_average_variables, variable_averages = None, None
         
         
-        # Calculate the learning rate schedule.
-        lr = _configure_learning_rate(global_step, cfg)
+        with tf.device(deploy_config.optimizer_device()):
+            learning_rate = _configure_learning_rate(global_step, cfg)
+            optimizer = _configure_optimizer(learning_rate, cfg)
+            summaries.add(tf.summary.scalar(name='learning_rate', tensor=learning_rate))
 
-        # Create an optimizer that performs gradient descent.
-        optimizer = _configure_optimizer(lr, cfg)
 
-        summaries.add(tf.summary.scalar(tensor=lr,
-                                        name='learning_rate'))
-        
-        
         tf.add_to_collection(tf.GraphKeys.UPDATE_OPS, ema.apply(moving_average_variables))
 
         trainable_vars = get_trainable_variables(trainable_scopes)
-        train_op = slim.learning.create_train_op(total_loss=total_loss, 
-                                                 optimizer=optimizer, 
-                                                 global_step=global_step,
-                                                 variables_to_train=trainable_vars,
-                                                 clip_gradient_norm=cfg.CLIP_GRADIENT_NORM)
-        
-        # Merge all of the summaries
-        summaries |= set(tf.get_collection(tf.GraphKeys.SUMMARIES))
+
+        total_loss, clones_gradients = model_deploy.optimize_clones(
+            clones,
+            optimizer,
+            var_list=trainable_vars)
+        # Add total_loss to summary.
+        summaries.add(tf.summary.scalar(name='losses/total_loss', tensor=total_loss))
+
+
+        # Create gradient updates.
+        grad_updates = optimizer.apply_gradients(clones_gradients,
+                                                global_step=global_step)
+        update_ops.append(grad_updates)
+
+        update_op = tf.group(*update_ops)
+        train_tensor = control_flow_ops.with_dependencies([update_op], total_loss,
+                                                        name='train_op')
+
+        # Add the summaries from the first clone. These contain the summaries
+        # created by model_fn and either optimize_clones() or _gather_clone_loss().
+        summaries |= set(tf.get_collection(tf.GraphKeys.SUMMARIES,
+                                        first_clone_scope))
+
+        # Merge all summaries together.
         summary_op = tf.summary.merge(inputs=list(summaries), name='summary_op')
 
         sess_config = tf.ConfigProto(
@@ -379,7 +384,7 @@ def train(tfrecords, logdir, cfg, pretrained_model_path=None, trainable_scopes=N
 
         # Run training.
         slim.learning.train(
-            train_op=train_op, 
+            train_op=train_tensor, 
             logdir=logdir,
             init_fn=get_init_function(logdir, pretrained_model_path, checkpoint_exclude_scopes, restore_variables_with_moving_averages=restore_variables_with_moving_averages, restore_moving_averages=restore_moving_averages, ema=ema),
             number_of_steps=cfg.NUM_TRAIN_ITERATIONS,
@@ -446,7 +451,11 @@ def parse_args():
     parser.add_argument('--restore_moving_averages', dest='restore_moving_averages',
                         help='If True, then we restore the variable that tracks the moving average of each trainable varibale.',
                         required=False, action='store_true', default=False)
-
+    
+    parser.add_argument('--num_gpus', dest='num_gpus',
+                        help='The number of gpus available for use.',
+                        required=False, type=int, default=1)
+    
     args = parser.parse_args()
     return args
 
@@ -475,6 +484,7 @@ def main():
         tfrecords=args.tfrecords,
         logdir=args.logdir,
         cfg=cfg,
+        num_gpus=args.num_gpus,
         pretrained_model_path=args.pretrained_model,
         trainable_scopes = args.trainable_scopes,
         checkpoint_exclude_scopes = args.checkpoint_exclude_scopes,
