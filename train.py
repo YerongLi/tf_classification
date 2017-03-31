@@ -35,7 +35,7 @@ from nets import nets_factory
 from preprocessing.inputs import input_nodes
 
 
-def _configure_learning_rate(global_step, cfg):
+def _configure_learning_rate(global_step, cfg, num_gpus):
     """Configures the learning rate.
     Args:
         num_samples_per_epoch: The number of samples in each epoch of training.
@@ -46,8 +46,8 @@ def _configure_learning_rate(global_step, cfg):
         ValueError: if cfg.LEARNING_RATE_DECAY_TYPE is not recognized.
     """
 
-
-    decay_steps = int(cfg.NUM_TRAIN_EXAMPLES / cfg.BATCH_SIZE * cfg.NUM_EPOCHS_PER_DELAY)
+    epoch_steps = cfg.NUM_TRAIN_EXAMPLES / (1.0 * cfg.BATCH_SIZE * num_gpus)
+    decay_steps = int(epoch_steps * cfg.NUM_EPOCHS_PER_DELAY)
 
     if cfg.LEARNING_RATE_DECAY_TYPE == 'exponential':
         return tf.train.exponential_decay(cfg.INITIAL_LEARNING_RATE,
@@ -334,7 +334,7 @@ def train(tfrecords, logdir, cfg, num_gpus=1, pretrained_model_path=None,
         
         
         with tf.device(deploy_config.optimizer_device()):
-            learning_rate = _configure_learning_rate(global_step, cfg)
+            learning_rate = _configure_learning_rate(global_step, cfg, num_gpus)
             optimizer = _configure_optimizer(learning_rate, cfg)
             summaries.add(tf.summary.scalar(name='learning_rate', tensor=learning_rate))
 
