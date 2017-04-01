@@ -339,7 +339,7 @@ def train(tfrecords, logdir, cfg, num_gpus=1, pretrained_model_path=None,
             summaries.add(tf.summary.scalar(name='learning_rate', tensor=learning_rate))
 
 
-        tf.add_to_collection(tf.GraphKeys.UPDATE_OPS, ema.apply(moving_average_variables))
+        update_ops.append(ema.apply(moving_average_variables))
 
         trainable_vars = get_trainable_variables(trainable_scopes)
 
