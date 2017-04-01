@@ -280,9 +280,9 @@ def train(tfrecords, logdir, cfg, num_gpus=1, pretrained_model_path=None,
 
             batched_one_hot_labels = slim.one_hot_encoding(batch_dict['labels'],
                                                         num_classes=cfg.NUM_CLASSES)
-        
+    
             batch_queue = slim.prefetch_queue.prefetch_queue(
-                               [batch_dict['inputs'], batched_one_hot_labels], capacity=2 * deploy_config.num_clones)
+                            [batch_dict['inputs'], batched_one_hot_labels], capacity=2 * deploy_config.num_clones)
 
         network_fn = nets_factory.get_network_fn(
             name=cfg.MODEL_NAME, 
@@ -329,6 +329,7 @@ def train(tfrecords, logdir, cfg, num_gpus=1, pretrained_model_path=None,
                 decay=cfg.MOVING_AVERAGE_DECAY,
                 num_updates=global_step
             )
+            update_ops.append(ema.apply(moving_average_variables))
         else:
             moving_average_variables, variable_averages = None, None
         
@@ -337,9 +338,6 @@ def train(tfrecords, logdir, cfg, num_gpus=1, pretrained_model_path=None,
             learning_rate = _configure_learning_rate(global_step, cfg, num_gpus)
             optimizer = _configure_optimizer(learning_rate, cfg)
             summaries.add(tf.summary.scalar(name='learning_rate', tensor=learning_rate))
-
-
-        update_ops.append(ema.apply(moving_average_variables))
 
         trainable_vars = get_trainable_variables(trainable_scopes)
 
@@ -362,8 +360,8 @@ def train(tfrecords, logdir, cfg, num_gpus=1, pretrained_model_path=None,
 
         # Add the summaries from the first clone. These contain the summaries
         # created by model_fn and either optimize_clones() or _gather_clone_loss().
-        summaries |= set(tf.get_collection(tf.GraphKeys.SUMMARIES,
-                                        first_clone_scope))
+        #summaries |= set(tf.get_collection(tf.GraphKeys.SUMMARIES,
+        #                                first_clone_scope))
 
         # Merge all summaries together.
         summary_op = tf.summary.merge(inputs=list(summaries), name='summary_op')
@@ -453,7 +451,7 @@ def parse_args():
                         required=False, action='store_true', default=False)
     
     parser.add_argument('--num_gpus', dest='num_gpus',
-                        help='The number of gpus available for use.',
+                        help='The number of gpus available for use. Each GPU will be given `--batch_size` images.',
                         required=False, type=int, default=1)
     
     args = parser.parse_args()
