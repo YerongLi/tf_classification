@@ -139,7 +139,7 @@ def get_trainable_variables(trainable_scopes):
     return variables_to_train
 
 
-def get_init_function(logdir, pretrained_model_path, checkpoint_exclude_scopes, restore_variables_with_moving_averages=False, restore_moving_averages=False, ema=None):
+def get_init_function(logdir, pretrained_model_path, checkpoint_exclude_scopes, restore_variables_with_moving_averages=False, restore_moving_averages=False, ema=None, global_step_val=None):
     """
     Args:
         logdir : location of where we will be storing checkpoint files.
@@ -153,7 +153,15 @@ def get_init_function(logdir, pretrained_model_path, checkpoint_exclude_scopes, 
 
 
     if pretrained_model_path is None:
-        return None
+        if global_step_val is None:
+            return None
+        else:
+            def callback(session):
+                with session.as_default():
+                    tf.global_variables_initializer().run()
+                    global_step = slim.get_or_create_global_step()
+                    sess.run(tf.assign(global_step, global_step_val))
+            return callback
 
     # Warn the user if a checkpoint exists in the train_dir. Then we'll be
     # ignoring the checkpoint anyway.
@@ -232,7 +240,8 @@ def get_init_function(logdir, pretrained_model_path, checkpoint_exclude_scopes, 
 def train(tfrecords, logdir, cfg, num_gpus=1, pretrained_model_path=None, 
           trainable_scopes=None, checkpoint_exclude_scopes=None, 
           restore_variables_with_moving_averages=False, 
-          restore_moving_averages=False):
+          restore_moving_averages=False,
+          global_step_val=None):
     """
     Args:
         tfrecords (list)
@@ -384,7 +393,7 @@ def train(tfrecords, logdir, cfg, num_gpus=1, pretrained_model_path=None,
         slim.learning.train(
             train_op=train_tensor, 
             logdir=logdir,
-            init_fn=get_init_function(logdir, pretrained_model_path, checkpoint_exclude_scopes, restore_variables_with_moving_averages=restore_variables_with_moving_averages, restore_moving_averages=restore_moving_averages, ema=ema),
+            init_fn=get_init_function(logdir, pretrained_model_path, checkpoint_exclude_scopes, restore_variables_with_moving_averages=restore_variables_with_moving_averages, restore_moving_averages=restore_moving_averages, ema=ema, global_step_val=global_step_val),
             number_of_steps=cfg.NUM_TRAIN_ITERATIONS,
             save_summaries_secs=cfg.SAVE_SUMMARY_SECS,
             save_interval_secs=cfg.SAVE_INTERVAL_SECS,
@@ -454,6 +463,10 @@ def parse_args():
                         help='The number of gpus available for use. Each GPU will be given `--batch_size` images.',
                         required=False, type=int, default=1)
     
+    parser.add_argument('--global_step', dest='global_step',
+                        help='Use this to override the global step variable in a checkpoint file.',
+                        required=False, type=int, default=None)
+    
     args = parser.parse_args()
     return args
 
@@ -487,7 +500,8 @@ def main():
         trainable_scopes = args.trainable_scopes,
         checkpoint_exclude_scopes = args.checkpoint_exclude_scopes,
         restore_variables_with_moving_averages=args.restore_variables_with_moving_averages, 
-        restore_moving_averages=args.restore_moving_averages
+        restore_moving_averages=args.restore_moving_averages,
+        global_step_val=args.global_step
     )
 
 if __name__ == '__main__':
